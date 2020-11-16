@@ -3,6 +3,7 @@
 ''''which python  >/dev/null && exec python  -u "$0" "$@" >> $LOG 2>&1 # '''
 
 # Copyright (C) 2014-2015 Nginx, Inc.
+# // few cosmetic changes by gf-mse
 
 import sys, os, signal, base64, ldap, argparse
 if sys.version_info.major == 2:
@@ -50,6 +51,8 @@ class AuthHandler(BaseHTTPRequestHandler):
     def do_GET(self):
 
         ctx = self.ctx
+        ctx['action'] = 'log request / headers'
+        self.log_request_headers() # shows nothing if not told to
 
         ctx['action'] = 'input parameters check'
         for k, v in self.get_params().items():
@@ -106,6 +109,21 @@ class AuthHandler(BaseHTTPRequestHandler):
         else:
             return None
 
+
+    def log_request_headers(self):
+        
+        if self.do_log_headers:
+            
+            self.log_request()
+            for key_val in self.headers.items():
+                h,v = key_val
+                # mask any headers that can contain authentication data
+                if h.lower() in ('authorization', 'cookie'):
+                    self.log_message("[h]: %s: ***", h)
+                else:
+                    self.log_message("[h]: %s: %s", *key_val)
+            
+            
 
     # Log the error and complete the request with appropriate status
     def auth_failed(self, ctx, errmsg = None):
@@ -171,6 +189,8 @@ class LDAPAuthHandler(AuthHandler):
     @classmethod
     def set_params(cls, params):
         cls.params = params
+        ## # allow missing fields (but risk fields mistyped later)
+        # cls.params.update(params)
 
     def get_params(self):
         return self.params
@@ -284,15 +304,24 @@ def exit_handler(signal, frame):
             sys.stderr.flush()
     sys.exit(0)
 
+
 if __name__ == '__main__':
+    
     parser = argparse.ArgumentParser(
         description="""Simple Nginx LDAP authentication helper.""")
+
+    # debug options (show headers, etc)
+    group = parser.add_argument_group("Debug options")
+    group.add_argument('--log-headers',  dest='log_headers', action='store_true', # metavar="...",
+        default=None, help="log request headers (to stderr)")
+    
     # Group for listen options:
     group = parser.add_argument_group("Listen options")
     group.add_argument('--host',  metavar="hostname",
         default="localhost", help="host to bind (Default: localhost)")
     group.add_argument('-p', '--port', metavar="port", type=int,
         default=8888, help="port to bind (Default: 8888)")
+    
     # ldap options:
     group = parser.add_argument_group(title="LDAP options")
     group.add_argument('-u', '--url', metavar="URL",
@@ -313,12 +342,14 @@ if __name__ == '__main__':
     group.add_argument('-f', '--filter', metavar='filter',
         default='(cn=%(username)s)',
         help="LDAP filter (Default: cn=%%(username)s)")
+    
     # http options:
     group = parser.add_argument_group(title="HTTP options")
     group.add_argument('-R', '--realm', metavar='"Restricted Area"',
         default="Restricted", help='HTTP auth realm (Default: "Restricted")')
     group.add_argument('-c', '--cookie', metavar="cookiename",
         default="", help="HTTP cookie name to set in (Default: unset)")
+
 
     args = parser.parse_args()
     global Listen
@@ -335,10 +366,22 @@ if __name__ == '__main__':
              'cookiename': ('X-CookieName', args.cookie)
     }
     LDAPAuthHandler.set_params(auth_params)
+    ## LDAPAuthHandler._log_headers = args.log_headers
+    AuthHandler.do_log_headers = args.log_headers
+
     server = AuthHTTPServer(Listen, LDAPAuthHandler)
+
+    # unlink the Unix socket if this is enabled 
+    # // the latter commented out by default, 
+    # // see 'Listen' at the top of the file
     signal.signal(signal.SIGINT, exit_handler)
     signal.signal(signal.SIGTERM, exit_handler)
 
+    # nb: we have also redefined default .log_message() behaviour from writing to stderr ..
+    # [ https://docs.python.org/3/library/http.server.html#http.server.BaseHTTPRequestHandler.log_message ]
+    # .. to writing to stdout ( and it is probably fully buffered )
     sys.stdout.write("Start listening on %s:%d...\n" % Listen)
     sys.stdout.flush()
+
     server.serve_forever()
+
