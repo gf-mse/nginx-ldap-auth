@@ -46,6 +46,8 @@ class AuthHTTPServer(ThreadingMixIn, HTTPServer):
 
 class AuthHandler(BaseHTTPRequestHandler):
 
+    do_log_headers = None
+
     # Return True if request is processed and response sent, otherwise False
     # Set ctx['user'] and ctx['pass'] for authentication
     def do_GET(self):
@@ -186,6 +188,8 @@ class LDAPAuthHandler(AuthHandler):
              'cookiename': ('X-CookieName', '')
         }
 
+    do_send_username = None
+
     @classmethod
     def set_params(cls, params):
         cls.params = params
@@ -286,6 +290,10 @@ class LDAPAuthHandler(AuthHandler):
 
             # Successfully authenticated user
             self.send_response(200)
+            x_username = self.do_send_username
+            if x_username :
+                self.send_header( x_username,  ldap_dn)
+
             self.end_headers()
 
         except:
@@ -349,6 +357,12 @@ if __name__ == '__main__':
         default="Restricted", help='HTTP auth realm (Default: "Restricted")')
     group.add_argument('-c', '--cookie', metavar="cookiename",
         default="", help="HTTP cookie name to set in (Default: unset)")
+    group.add_argument('--send-username-header', dest='send_username', action='store', metavar="x-username",
+        default='', help="if set -- return back a username under a given header (e.g. 'x-username') ")
+    #   ^^^ nb: this will send the (first) username that is found on the LDAP server after applying the filter,
+    #           that is -- not necessarily the username that was sent;
+    #           in other words, if 'abcdef' is a unique user prefix with the only match 'abcdef123',
+    #           then 'abcdef*:correct-password' and a filter '(cn=%(username)s)' would succeed and return 'abcdef123'
 
 
     args = parser.parse_args()
@@ -368,6 +382,19 @@ if __name__ == '__main__':
     LDAPAuthHandler.set_params(auth_params)
     ## LDAPAuthHandler._log_headers = args.log_headers
     AuthHandler.do_log_headers = args.log_headers
+    ## LDAPAuthHandler.do_send_username = None
+    send_username = args.send_username.strip()
+    if send_username:
+        # be standard conforming -- don't create nonstandard headers
+        if not send_username.lower().startswith('x-'):
+            # adhere to the original style  
+            if send_username[:1].isupper():
+                send_username += 'X-'
+                # send_username = send_username.title()
+            else:
+                send_username += 'x-'
+
+        LDAPAuthHandler.do_send_username = send_username
 
     server = AuthHTTPServer(Listen, LDAPAuthHandler)
 
