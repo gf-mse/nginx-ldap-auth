@@ -292,7 +292,8 @@ class LDAPAuthHandler(AuthHandler):
             self.send_response(200)
             x_username = self.do_send_username
             if x_username :
-                self.send_header( x_username,  ldap_dn)
+                ## self.send_header( x_username,  ldap_dn)
+                self.send_header( x_username,  ctx['user'])
 
             self.end_headers()
 
