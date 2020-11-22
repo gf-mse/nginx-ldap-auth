@@ -1,9 +1,12 @@
-#!/bin/sh
-''''[ -z $LOG ] && export LOG=/dev/stdout # '''
-''''which python  >/dev/null && exec python  -u "$0" "$@" >> $LOG 2>&1 # '''
+#!/usr/bin/python
+## #!/bin/sh
+## ''''[ -z $LOG ] && export LOG=/dev/stdout # '''
+## ''''which python  >/dev/null && exec python  -u "$0" "$@" >> $LOG 2>&1 # '''
 
 # Copyright (C) 2014-2015 Nginx, Inc.
 # // few cosmetic changes by gf-mse
+
+from __future__ import print_function
 
 import sys, os, signal, base64, ldap, argparse
 if sys.version_info.major == 2:
@@ -151,25 +154,47 @@ class AuthHandler(BaseHTTPRequestHandler):
         self.send_header('Cache-Control', 'no-cache')
         self.end_headers()
 
+        # help debugging
+        self.flush_log_buffer()
+
     def get_params(self):
         return {}
 
     def log_message(self, format, *args):
         if len(self.client_address) > 0:
             addr = BaseHTTPRequestHandler.address_string(self)
+            ## addr = self.address_string()
         else:
             addr = "-"
+
+        remote = self.headers.get('x-forwarded-for', '-')
 
         if not hasattr(self, 'ctx'):
             user = '-'
         else:
-            user = self.ctx['user']
+            ## user = self.ctx['user']
+            user = '(%s)' % ( self.ctx['user'], )
 
-        sys.stdout.write("%s - %s [%s] %s\n" % (addr, user,
-                         self.log_date_time_string(), format % args))
+
+        sys.stdout.write("%s - %s %s [%s] %s\n" % (addr, remote, user, self.log_date_time_string()
+                                                  , format % args))
+
+    def flush_log_buffer(self):
+        sys.stdout.flush()
 
     def log_error(self, format, *args):
         self.log_message(format, *args)
+
+    def send_error( self, status_code, str_message, *args, **kwargs ):
+        
+        BaseHTTPRequestHandler.send_error( self, status_code, str_message, *args, **kwargs )
+        self.flush_log_buffer()
+
+    def end_headers(self):
+        
+        BaseHTTPRequestHandler.end_headers( self )
+        self.flush_log_buffer()
+        
 
 
 # Verify username/password against LDAP server
@@ -202,7 +227,9 @@ class LDAPAuthHandler(AuthHandler):
     # GET handler for the authentication request
     def do_GET(self):
 
-        ctx = dict()
+        ## ctx = dict()
+        ## self.ctx = ctx
+        ctx = getattr( self, 'ctx', dict() )
         self.ctx = ctx
 
         ctx['action'] = 'initializing basic auth handler'
@@ -210,22 +237,23 @@ class LDAPAuthHandler(AuthHandler):
 
         if AuthHandler.do_GET(self):
             # request already processed
-            return
+            self.flush_log_buffer()
+            return True
 
         ctx['action'] = 'empty password check'
         if not ctx['pass']:
             self.auth_failed(ctx, 'attempt to use empty password')
-            return
+            return True
 
         try:
             # check that uri and baseDn are set
             # either from cli or a request
             if not ctx['url']:
                 self.log_message('LDAP URL is not set!')
-                return
+                return True
             if not ctx['basedn']:
                 self.log_message('LDAP baseDN is not set!')
-                return
+                return True
 
             ctx['action'] = 'initializing LDAP connection'
             ldap_obj = ldap.initialize(ctx['url']);
@@ -268,7 +296,7 @@ class LDAPAuthHandler(AuthHandler):
 
             if nres < 1:
                 self.auth_failed(ctx, 'no objects found')
-                return
+                return True
 
             if nres > 1:
                 self.log_message("note: filter match multiple objects: %d, using first" % nres)
@@ -278,7 +306,7 @@ class LDAPAuthHandler(AuthHandler):
 
             if ldap_dn == None:
                 self.auth_failed(ctx, 'matched object has no dn')
-                return
+                return True
 
             self.log_message('attempting to bind using dn "%s"' % (ldap_dn))
 
@@ -287,6 +315,9 @@ class LDAPAuthHandler(AuthHandler):
             ldap_obj.bind_s(ldap_dn, ctx['pass'], ldap.AUTH_SIMPLE)
 
             self.log_message('Auth OK for user "%s"' % (ctx['user']))
+            
+            ## # we will use it in a child handler as a control check for unsuccessful authentication
+            ## ctx['username'] = ctx['user']
 
             # Successfully authenticated user
             self.send_response(200)
@@ -299,7 +330,10 @@ class LDAPAuthHandler(AuthHandler):
 
         except:
             self.auth_failed(ctx)
+            return True
 
+
+# actually, this is needed for Unix sockets only
 def exit_handler(signal, frame):
     global Listen
 
@@ -312,6 +346,24 @@ def exit_handler(signal, frame):
                              (Listen, str(value)))
             sys.stderr.flush()
     sys.exit(0)
+
+
+# -----------------------------------------------------------------------------
+
+def normalize_header( header_name ):
+    """ be nice and prepend a header name with an 'x-' """
+
+    # be standard conforming -- don't create nonstandard headers
+    if not header_name.lower().startswith('x-'):
+        # adhere to the original style  
+        if header_name[:1].isupper():
+            header_name += 'X-'
+            # send_username = send_username.title()
+        else:
+            header_name += 'x-'
+    
+    return header_name
+
 
 
 if __name__ == '__main__':
@@ -356,7 +408,10 @@ if __name__ == '__main__':
     group = parser.add_argument_group(title="HTTP options")
     group.add_argument('-R', '--realm', metavar='"Restricted Area"',
         default="Restricted", help='HTTP auth realm (Default: "Restricted")')
-    group.add_argument('-c', '--cookie', metavar="cookiename",
+    ## group = parser.add_argument_group("Cookie options")
+    ## group.add_argument('--cookie-name', dest = 'cookie_name', metavar="cookie name", action='store'
+    ##     default='nginxauth', help="authentication cookie name")
+    group.add_argument('-c', '--cookie-name', '--cookie', metavar="cookiename", dest = 'cookie_name', 
         default="", help="HTTP cookie name to set in (Default: unset)")
     group.add_argument('--send-username-header', dest='send_username', action='store', metavar="x-username",
         default='', help="if set -- return back a username under a given header (e.g. 'x-username') ")
@@ -366,9 +421,32 @@ if __name__ == '__main__':
     #           then 'abcdef*:correct-password' and a filter '(cn=%(username)s)' would succeed and return 'abcdef123'
 
 
+    group = parser.add_argument_group(title="Command line arguments")
+    group.add_argument( 'argv', metavar='arg'
+                      ## , dest='argv' // 'dest supplied twice for positional argument'
+                      , action='store', nargs='*'
+                      , help="say 'run' or 'go' to start serving connections"
+                      )
+
     args = parser.parse_args()
+    if not args.argv:
+        parser.print_help()
+        sys.exit(2)
+
+    # else ...
     global Listen
     Listen = (args.host, args.port)
+
+    #
+    # AuthHandler options
+    #
+
+    AuthHandler.do_log_headers = args.log_headers
+
+    #
+    # LDAPAuthHandler options
+    #
+
     auth_params = {
              'realm': ('X-Ldap-Realm', args.realm),
              'url': ('X-Ldap-URL', args.url),
@@ -378,24 +456,18 @@ if __name__ == '__main__':
              'template': ('X-Ldap-Template', args.filter),
              'binddn': ('X-Ldap-BindDN', args.binddn),
              'bindpasswd': ('X-Ldap-BindPass', args.bindpw),
-             'cookiename': ('X-CookieName', args.cookie)
+             ## 'cookiename': ('X-CookieName', args.cookie)
+             'cookiename': ('X-CookieName', args.cookie_name)
     }
     LDAPAuthHandler.set_params(auth_params)
     ## LDAPAuthHandler._log_headers = args.log_headers
-    AuthHandler.do_log_headers = args.log_headers
+    ## AuthHandler.do_log_headers = args.log_headers
     ## LDAPAuthHandler.do_send_username = None
     send_username = args.send_username.strip()
     if send_username:
-        # be standard conforming -- don't create nonstandard headers
-        if not send_username.lower().startswith('x-'):
-            # adhere to the original style  
-            if send_username[:1].isupper():
-                send_username += 'X-'
-                # send_username = send_username.title()
-            else:
-                send_username += 'x-'
-
+        send_username = normalize_header( send_username )
         LDAPAuthHandler.do_send_username = send_username
+
 
     server = AuthHTTPServer(Listen, LDAPAuthHandler)
 
