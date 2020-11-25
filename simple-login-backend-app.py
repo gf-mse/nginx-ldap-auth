@@ -3,6 +3,8 @@
 ## #!/bin/sh
 ## ''''which python  >/dev/null && exec python  "$0" "$@" # '''
 
+from __future__ import print_function
+
 # based on a 2014-2015 example by [Copyright (C)] Nginx, Inc.
 
 # Example of an application working on port 9000
@@ -29,16 +31,34 @@ elif sys.version_info.major == 3:
     from socketserver import ThreadingMixIn
 
 
-def ensure_bytes(data):
-    return data if sys.version_info.major == 2 else data.encode("utf-8")
+## from redis_wrapper import CustomRedisMixin
+## from redis_wrapper import CustomRedisMixin, ensure_bytes
+from redis_wrapper import CustomRedisMixin, ensure_bytes, KEY_HISTORY_MAXLEN
+
+
+## # let us use simplejson for serializing
+## from json import ( dumps as json_dumps, loads as json_loads )
+
+APP_VERSION = '1.0 fernet-json'
+
+##  def ensure_bytes(data):
+##      return data if sys.version_info.major == 2 else data.encode("utf-8")
 
 
 class AuthHTTPServer(ThreadingMixIn, HTTPServer):
     pass
 
-class AppHandler(BaseHTTPRequestHandler):
+class AppHandler( BaseHTTPRequestHandler, CustomRedisMixin ):
+
+    # print exceptions to stderr
+    _debug_mode = None
+
+    # print request headers
+    do_log_headers = None
 
     def do_GET(self):
+
+        self.log_request_headers() # shows nothing if not told to
 
         url = urlparse(self.path)
 
@@ -73,7 +93,7 @@ class AppHandler(BaseHTTPRequestHandler):
 <html>
   <head>
     <meta http-equiv=Content-Type content="text/html;charset=UTF-8">
-    <title>Auth form example</title>
+    <title>Authentication</title>
   </head>
   <body>
     <form action="/login" method="post">
@@ -100,6 +120,8 @@ class AppHandler(BaseHTTPRequestHandler):
     # processes posted form and sets the cookie with login/password
     def do_POST(self):
 
+        self.log_request_headers() # shows nothing if not told to
+
         # prepare arguments for cgi module to read posted form
         env = {'REQUEST_METHOD':'POST',
                'CONTENT_TYPE': self.headers['Content-Type'],}
@@ -113,38 +135,57 @@ class AppHandler(BaseHTTPRequestHandler):
         passwd = form.getvalue('password')
         target = form.getvalue('target')
 
+        cookie_headers = []
+
         if user != None and passwd != None and target != None:
+
+            # let's encode the received data
+            try:
+                ## # WARNING WARNING WARNING
+                ## enc = base64.b64encode(ensure_bytes(user + ':' + passwd))
+                data = dict( user=user, passwd=passwd, httponly = True )
+                if self._set_secure_cookie:
+                    data['secure'] = True
+                # could do the same for max-age, 
+                # although we shall make it arrive from the form 
+                
+                pairs = self.get_set_enc_keys()
+                pairs.sort() # ascending -- recent last
+                
+                if not pairs:
+                    self.fail( 418, "internal error"
+                             , log_message = "problem: no valid encryption keys found in redis" )
+                    return True
+                    
+                # else ...
+                storage_key, encryption_key = pairs[-1]
+                cookie_data = self.encrypt_cookie( data, encryption_key )
+
+                self.log_message( "cooking headers for user '%s' ... ", user )
+
+                headers_text = self.format_cookie( self._cookie_name, cookie_data
+                                                 , secure = data.get('secure')
+                                                 , max_age = data.get('max-age')
+                                                 , header='', sep='\0' )
+
+                cookie_headers = [ h.lstrip() for h in headers_text.split('\0') ]
+
+            except:
+                
+                self.fail( 418, "internal error", log_message = "failed at encoding stage" )
+                if self._debug_mode :
+                    raise
+                # else ...
+                return True
 
             # form is filled, set the cookie and redirect to target
             # so that auth daemon will be able to use information from cookie
 
             self.send_response(302)
 
-            # WARNING WARNING WARNING
-            #
-            # base64 is just an example method that allows to pack data into
-            # a cookie. You definitely want to perform some encryption here
-            # and share a key with auth daemon that extracts this information
-            #
-            # WARNING WARNING WARNING
-            enc = base64.b64encode(ensure_bytes(user + ':' + passwd))
-            # we shall betetr decode all of it at once
-            if 0:
-                if sys.version_info.major == 3:
-                    enc = enc.decode()
-
-            ## self.send_header('Set-Cookie', b'nginxauth=' + enc + b'; httponly')
-            ## cookie_text = self._cookie_name + enc + b'; httponly'
-            cookie_text = "{}={}; httponly".format( self._cookie_name, enc )
-            if self._set_secure_cookie:
-                # [ https://developer.mozilla.org/en-US/docs/Web/HTTP/Headers/Set-Cookie#Secure ]
-                ## cookie_text += b'; secure'
-                cookie_text += '; secure'
-
-            self.log_message( "setting a cookie for user '%s' ... ", user )
-
-            cookie_bytes = ensure_bytes( cookie_text )
-            self.send_header( 'Set-Cookie', cookie_bytes )
+            for h in cookie_headers:
+                cookie_bytes = ensure_bytes( h )
+                self.send_header( 'Set-Cookie', cookie_bytes )
 
             self.send_header( 'Location', target )
             self.end_headers()
@@ -170,6 +211,20 @@ class AppHandler(BaseHTTPRequestHandler):
         self.log_message(format, *args)
 
 
+    def log_request_headers(self):
+        
+        if self.do_log_headers:
+            
+            self.log_request()
+            for key_val in self.headers.items():
+                h,v = key_val
+                # mask any headers that can contain authentication data
+                if h.lower() in ('authorization', 'cookie'):
+                    self.log_message("[h]: %s: ***", h)
+                else:
+                    self.log_message("[h]: %s: %s", *key_val)
+
+
     def flush_log_buffer(self):
         sys.stdout.flush()
 
@@ -177,6 +232,12 @@ class AppHandler(BaseHTTPRequestHandler):
         
         BaseHTTPRequestHandler.send_error( self, status_code, str_message, *args, **kwargs )
         self.flush_log_buffer()
+
+    def fail( self, status, message, log_message, *args, **kwargs ):
+
+        self.log_error( log_message )
+        self.send_error( status, message, *args, **kwargs )
+
 
     def end_headers(self):
         
@@ -193,6 +254,10 @@ def parse_argv():
     parser = argparse.ArgumentParser(
         description="""Simple Nginx LDAP authentication helper.""")
     
+    group = parser.add_argument_group("Version info")
+    group.add_argument('--version',  dest='print_version', action='store_true', # metavar="...",
+        default=None, help="print the version and exit")
+
     # Group for listen options:
     group = parser.add_argument_group("Listen options")
     group.add_argument('--host',  metavar="hostname",
@@ -206,6 +271,22 @@ def parse_argv():
     group.add_argument('--secure-cookie', '--cookie-demand-https', dest = 'want_secure_cookie', action='store_true',
         default=None, help="insist for a secure connection (https) for the cookie")
 
+    # redis key options:
+    group = parser.add_argument_group("Redis / key options")
+    group.add_argument('--redis-server',  metavar="redis-server", dest='redis_server', action='store',
+        default="localhost", help="redis server (Default: localhost)")
+    group.add_argument('--redis-port', metavar="redis-port", dest='redis_port', action='store', type=int, 
+        default=6379, help="redis server port (Default: 6379)")
+    group.add_argument('--redis-key-history-length',  metavar="key-history-maxdays", dest='key_history_maxdays', action='store', type=int,
+        default=KEY_HISTORY_MAXLEN, help="keep encryption keys for this many days; default: " + str(KEY_HISTORY_MAXLEN) )
+
+
+    # debug options (show headers, etc)
+    group = parser.add_argument_group("Debug options")
+    group.add_argument('--debug-mode',  dest='_debug_mode', action='store_true', # metavar="...",
+        default=None, help="log exceptions to stderr")
+    group.add_argument('--log-headers',  dest='log_headers', action='store_true', # metavar="...",
+        default=None, help="log request headers (to stderr)")
 
     group = parser.add_argument_group(title="Command line arguments")
     group.add_argument( 'argv', metavar='arg'
@@ -222,6 +303,11 @@ def parse_argv():
 if __name__ == '__main__':
 
     args, parser = parse_argv()
+    
+    if args.print_version:
+        print( APP_VERSION, file=sys.stdout )
+        sys.exit(1)
+    
     if not args.argv:
         parser.print_help()
         sys.exit(2)
@@ -234,9 +320,22 @@ if __name__ == '__main__':
     # AppHandler options, if any
     #
 
+    redis_key_params = {
+        # redis host
+        'host' : args.redis_server
+        # redis port ( 6379 is redis default )
+    ,   'port' : args.redis_port
+        # how many days ( or, to be more accurate, _distinct keys_ ) to keep
+    ,   'keep_days' : args.key_history_maxdays
+    }
+    AppHandler.set_redis_params( redis_key_params )
+
     ## AppHandler._cookie_name        = ensure_bytes( args.cookie_name )
     AppHandler._cookie_name        = args.cookie_name
     AppHandler._set_secure_cookie  = args.want_secure_cookie
+
+    AppHandler._debug_mode        = args._debug_mode
+    AppHandler.do_log_headers     = args.log_headers
 
     server = AuthHTTPServer(Listen, AppHandler)
     

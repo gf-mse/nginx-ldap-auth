@@ -4,7 +4,7 @@
 ## ''''which python  >/dev/null && exec python  -u "$0" "$@" >> $LOG 2>&1 # '''
 
 # Copyright (C) 2014-2015 Nginx, Inc.
-# // few cosmetic changes by gf-mse
+# // some additions  ( cookie encryption, etc )  by gf-mse  
 
 from __future__ import print_function
 
@@ -17,6 +17,55 @@ elif sys.version_info.major == 3:
     from http.server import HTTPServer, BaseHTTPRequestHandler
 
 if not hasattr(__builtins__, "basestring"): basestring = (str, bytes)
+
+# -----------------------------------------------------------------------------
+# here we are using cryptography.fernet to encrypt the cookies,
+# and redis db to share keys between the authentication server and the login backend.
+#
+# ( we could have implemented both in a single process 
+#   and thus keep the keys within the same process address space, 
+#   but instead we assume that hte main protected resource 
+#   does not have access to it -- e.g. sits inside a container )
+#
+
+
+##  # let us use simplejson for serializing
+##  from json import ( dumps as json_dumps, loads as json_loads )
+
+from redis_wrapper import CustomRedisMixin, ensure_bytes, KEY_HISTORY_MAXLEN
+
+#
+# on encryption keys:
+#
+#  - they are stored in a Redis database, 
+#    which is expected to be local 
+#    (db connection is not encrypted) 
+#    and isolated from the backend
+#  - in the code, they may be called "storage values"
+#    as opposed to "storage keys", which are originally just dates
+#  - we are trying to issue a new key on each day 
+#    where we have at least one request
+#  - if a cookie was encrypted not longer than "max days" ago,
+#    we are trying to re-encrypt it with a most recent key
+#    and return back to the client
+#  - finally, we may add a "max-age" parameter 
+#    to advise the client to dispose the cookie after some timeout
+#
+
+#
+# on passing cookies:
+#
+# - our cookie {cookiename} _may_ be accompanied by {cookiename_attrs}
+#   // it would probably be more secure to pack them in a single json, though
+#
+
+APP_VERSION = '1.0 fernet'
+
+## DAY_IN_SECONDS = 24 * 60 * 60.0
+## KEY_HISTORY_MAXLEN = 14 + 3  # two weeks and a little something
+
+
+# -----------------------------------------------------------------------------
 
 #Listen = ('localhost', 8888)
 #Listen = "/tmp/auth.sock"    # Also uncomment lines in 'Requests are
@@ -47,9 +96,28 @@ class AuthHTTPServer(ThreadingMixIn, HTTPServer):
 #    pass
 # -----------------------------------------------------------------------------
 
-class AuthHandler(BaseHTTPRequestHandler):
+
+## def ensure_bytes(data):
+##     return data if sys.version_info.major == 2 else data.encode("utf-8")
+if 0:
+    if sys.version_info.major == 2:
+        def ensure_bytes(data):
+            return data
+    else:
+        def ensure_bytes(data):
+            if not isinstance( data, bytes ):
+                result = data.encode("utf-8")
+            else:
+                result = data
+            return result
+
+
+class AuthHandler(BaseHTTPRequestHandler, CustomRedisMixin):
 
     do_log_headers = None
+    use_cookie_only = None # ignore 'authorization' header
+
+    # -------------------------------------------------------------------------
 
     # Return True if request is processed and response sent, otherwise False
     # Set ctx['user'] and ctx['pass'] for authentication
@@ -67,7 +135,9 @@ class AuthHandler(BaseHTTPRequestHandler):
                 return True
 
         ctx['action'] = 'performing authorization'
-        auth_header = self.headers.get('Authorization')
+        auth_header = None # default
+        if not self.use_cookie_only:
+            auth_header = self.headers.get('Authorization')
         auth_cookie = self.get_cookie(ctx['cookiename'])
 
         if auth_cookie != None and auth_cookie != '':
@@ -89,11 +159,48 @@ class AuthHandler(BaseHTTPRequestHandler):
         ctx['action'] = 'decoding credentials'
 
         try:
-            auth_decoded = base64.b64decode(auth_header[6:])
-            if sys.version_info.major == 3: auth_decoded = auth_decoded.decode("utf-8")
-            user, passwd = auth_decoded.split(':', 1)
+            ## auth_decoded = base64.b64decode(auth_header[6:])
+            pairs = self.get_set_enc_keys()
+            pairs.sort( reverse = True ) # recent first
+            decoded = self.decrypt_cookie( auth_header[6:], pairs, sort=False )
+            if decoded is None:
+                self.log_error("none of %s known keys could decrypt the supplied credentials", len(pairs))
+                self.auth_failed(ctx)
+                return True                
+            # else ...
+            ## storage_key, auth_decoded = decoded
+            storage_key, data = decoded # assume a json-decoded object
+
+            # the list is not empty, since we have just successfully used it for decoding
+            recent_pair = pairs[0]
+            recent_storage_key, recent_enc_key = recent_pair
+            if storage_key != recent_storage_key :
+                self.log_message("re-encrypting data of '%s' with '%s' ...", storage_key, recent_storage_key )
+                # re-encrypt the data with the most recent key ..
+                encrypted = self.encrypt_cookie( data, recent_enc_key )
+                ## new_cookie_text = "{}={}; httponly".format( self._cookie_name, enc )
+                
+                self.log_message( "cooking headers ..." )
+                headers_text = self.format_cookie( ctx['cookiename'], encrypted
+                                                 , secure = data.get('secure')
+                                                 , max_age = data.get('max-age')
+                                                 , header='', sep='\0' )
+                headers_list = [ h.lstrip() for h in headers_text.split('\0') ]
+
+                ctx['set-cookies'] = headers_list # could be empty
+
+            ## if sys.version_info.major == 3: auth_decoded = auth_decoded.decode("utf-8")
+            ## user, passwd = auth_decoded.split(':', 1)
+
+            user = data.get('user')
+            passwd = data.get('passwd')
 
         except:
+            self.auth_failed(ctx)
+            return True
+
+        if not user or not passwd:
+            self.log_error("empty username ('%s') or password", user)
             self.auth_failed(ctx)
             return True
 
@@ -224,6 +331,7 @@ class LDAPAuthHandler(AuthHandler):
     def get_params(self):
         return self.params
 
+
     # GET handler for the authentication request
     def do_GET(self):
 
@@ -321,6 +429,14 @@ class LDAPAuthHandler(AuthHandler):
 
             # Successfully authenticated user
             self.send_response(200)
+            
+            # send back the re-encrypted cookie, if any )
+            c_headers = ctx.get('set-cookies', [])
+            for h in c_headers:
+                cookie_bytes = ensure_bytes( h )
+                self.send_header( 'Set-Cookie', cookie_bytes )
+
+            # also send the username, if requested
             x_username = self.do_send_username
             if x_username :
                 ## self.send_header( x_username,  ldap_dn)
@@ -373,6 +489,8 @@ if __name__ == '__main__':
 
     # debug options (show headers, etc)
     group = parser.add_argument_group("Debug options")
+    group.add_argument('--version',  dest='print_version', action='store_true', # metavar="...",
+        default=None, help="print the version and exit")
     group.add_argument('--log-headers',  dest='log_headers', action='store_true', # metavar="...",
         default=None, help="log request headers (to stderr)")
     
@@ -384,7 +502,7 @@ if __name__ == '__main__':
         default=8888, help="port to bind (Default: 8888)")
     
     # ldap options:
-    group = parser.add_argument_group(title="LDAP options")
+    group = ldap_group = parser.add_argument_group(title="LDAP options")
     group.add_argument('-u', '--url', metavar="URL",
         default="ldap://localhost:389",
         help=("LDAP URI to query (Default: ldap://localhost:389)"))
@@ -403,7 +521,7 @@ if __name__ == '__main__':
     group.add_argument('-f', '--filter', metavar='filter',
         default='(cn=%(username)s)',
         help="LDAP filter (Default: cn=%%(username)s)")
-    
+
     # http options:
     group = parser.add_argument_group(title="HTTP options")
     group.add_argument('-R', '--realm', metavar='"Restricted Area"',
@@ -413,12 +531,25 @@ if __name__ == '__main__':
     ##     default='nginxauth', help="authentication cookie name")
     group.add_argument('-c', '--cookie-name', '--cookie', metavar="cookiename", dest = 'cookie_name', 
         default="", help="HTTP cookie name to set in (Default: unset)")
+    # this deals more with authentication, so we list it here, but logically assign to LDAP options:
+    ldap_group.add_argument('--cookie-only', '--ignore-auth-header', dest = 'auth_cookie_only', action = 'store_true',
+        default=None, help="Ignore authorization header and accept only (encrypted) authentication cookie")
     group.add_argument('--send-username-header', dest='send_username', action='store', metavar="x-username",
         default='', help="if set -- return back a username under a given header (e.g. 'x-username') ")
     #   ^^^ nb: this will send the (first) username that is found on the LDAP server after applying the filter,
     #           that is -- not necessarily the username that was sent;
     #           in other words, if 'abcdef' is a unique user prefix with the only match 'abcdef123',
     #           then 'abcdef*:correct-password' and a filter '(cn=%(username)s)' would succeed and return 'abcdef123'
+
+
+    # redis key options:
+    group = parser.add_argument_group("Redis / key options")
+    group.add_argument('--redis-server',  metavar="redis-server", dest='redis_server', action='store',
+        default="localhost", help="redis server (Default: localhost)")
+    group.add_argument('--redis-port', metavar="redis-port", dest='redis_port', action='store', type=int, 
+        default=6379, help="redis server port (Default: 6379)")
+    group.add_argument('--redis-key-history-length',  metavar="key-history-maxdays", dest='key_history_maxdays', action='store', type=int,
+        default=KEY_HISTORY_MAXLEN, help="keep encryption keys for this many days; default: " + str(KEY_HISTORY_MAXLEN) )
 
 
     group = parser.add_argument_group(title="Command line arguments")
@@ -429,6 +560,11 @@ if __name__ == '__main__':
                       )
 
     args = parser.parse_args()
+    
+    if args.print_version:
+        print( APP_VERSION, file=sys.stdout )
+        sys.exit(1)
+
     if not args.argv:
         parser.print_help()
         sys.exit(2)
@@ -440,6 +576,18 @@ if __name__ == '__main__':
     #
     # AuthHandler options
     #
+
+    AuthHandler.use_cookie_only = args.auth_cookie_only
+
+    redis_key_params = {
+        # redis host
+        'host' : args.redis_server
+        # redis port ( 6379 is redis default )
+    ,   'port' : args.redis_port
+        # how many days ( or, to be more accurate, _distinct keys_ ) to keep
+    ,   'keep_days' : args.key_history_maxdays
+    }
+    AuthHandler.set_redis_params( redis_key_params )
 
     AuthHandler.do_log_headers = args.log_headers
 
@@ -467,7 +615,6 @@ if __name__ == '__main__':
     if send_username:
         send_username = normalize_header( send_username )
         LDAPAuthHandler.do_send_username = send_username
-
 
     server = AuthHTTPServer(Listen, LDAPAuthHandler)
 
